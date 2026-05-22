@@ -5053,14 +5053,18 @@ def _aggregate_series_for_forecast_view(series: pd.Series, view_key: str | None 
     group_by = _forecast_view_config(view_key).get("group_by", "daily")
     if group_by == "weekly":
         grouped_index = clean.index.to_period("W-SUN").start_time
-        return clean.groupby(grouped_index).sum().sort_index()
-    if group_by == "monthly":
+    elif group_by == "monthly":
         grouped_index = clean.index.to_period("M").start_time
-        return clean.groupby(grouped_index).sum().sort_index()
-    if group_by == "yearly":
+    elif group_by == "yearly":
         grouped_index = clean.index.to_period("Y").start_time
-        return clean.groupby(grouped_index).sum().sort_index()
-    return clean.groupby(clean.index.normalize()).sum().sort_index()
+    else:
+        grouped_index = clean.index.normalize()
+
+    # Pandas can misinterpret a DatetimeIndex grouper by name on hosted builds,
+    # which caused a slow/timeout path inside SeriesGroupBy during Render login.
+    # Convert the grouping labels to a plain Series aligned to the original index.
+    grouping_labels = pd.Series(pd.to_datetime(grouped_index, errors="coerce"), index=clean.index)
+    return clean.groupby(grouping_labels).sum().sort_index()
 
 
 def _limit_forecast_view_points(series: pd.Series, view_key: str | None, point_type: str = "history") -> pd.Series:
@@ -5076,6 +5080,36 @@ def _limit_forecast_view_points(series: pd.Series, view_key: str | None, point_t
     if point_type == "forecast":
         return series.head(point_limit)
     return series.tail(point_limit)
+
+
+def _safe_forecast_quantity(value: Any) -> float | None:
+    """Convert a forecast quantity to float without invoking heavier pandas scalar paths."""
+    try:
+        if value is None or value == "":
+            return None
+        numeric = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def page_context_warmup_enabled() -> bool:
+    """Keep page warm-up opt-in on hosted services to avoid login/request timeouts."""
+    return str(os.environ.get("STOCKWISE_WARMUP_PAGE_CONTEXTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def full_forecast_chart_build_enabled() -> bool:
+    """Build every product chart only when explicitly enabled; summaries still render normally."""
+    return str(os.environ.get("STOCKWISE_FULL_FORECAST_CHARTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def forecast_chart_product_limit() -> int:
+    try:
+        return max(0, int(os.environ.get("STOCKWISE_FORECAST_CHART_PRODUCT_LIMIT", "10")))
+    except Exception:
+        return 10
 
 
 def _build_forecast_line_datasets(historical_values: list[float], forecast_values: list[float], future_count: int) -> tuple[list[float | None], list[float | None]]:
@@ -5149,8 +5183,8 @@ def _forecast_total_from_entry(forecast_entry: dict[str, Any] | None, forecast_d
             horizon = index
         if horizon > forecast_days:
             continue
-        quantity = pd.to_numeric(item.get("quantity"), errors="coerce")
-        if pd.notna(quantity):
+        quantity = _safe_forecast_quantity(item.get("quantity"))
+        if quantity is not None:
             total += float(quantity)
             found = True
 
@@ -5895,13 +5929,12 @@ def _ensure_state_loaded_from_db() -> None:
 
         warmup_upload_id = meta.get('upload_id')
         warmup_key = f"db:{user_id}:{warmup_upload_id}" if warmup_upload_id else None
-        if warmup_key and _state_get("db_loaded_context_warmup_key") != warmup_key:
+        if page_context_warmup_enabled() and warmup_key and _state_get("db_loaded_context_warmup_key") != warmup_key:
             try:
                 warm_up_generated_page_contexts(df)
                 _state_set("db_loaded_context_warmup_key", warmup_key)
-            except Exception:
-                # Display cache warm-up should never block page loading.
-                pass
+            except Exception as exc:
+                print(f"[StockWise page warmup skipped] {type(exc).__name__}: {exc}", flush=True)
     elif latest_meta is None:
         state.processed_data = None
         state.processed_filename = None
@@ -5959,10 +5992,11 @@ def load_demo_dataset_for_current_session(force: bool = False) -> pd.DataFrame |
     _state_set("model_ui_summary", artifacts.get("model_ui_summary"))
     _state_set("latest_model_run_id", None)
     clear_insights_cache()
-    try:
-        warm_up_generated_page_contexts(demo_df)
-    except Exception:
-        pass
+    if page_context_warmup_enabled():
+        try:
+            warm_up_generated_page_contexts(demo_df)
+        except Exception as exc:
+            print(f"[StockWise page warmup skipped] {type(exc).__name__}: {exc}", flush=True)
     return demo_df
 
 
@@ -7256,8 +7290,8 @@ def get_product_chart_data(df: pd.DataFrame | None, product_name: str, forecast_
     if forecast_status == "completed":
         for item in (forecast_daily or [])[:forecast_days]:
             item_date = pd.to_datetime(item.get("date"), errors="coerce") if isinstance(item, dict) else pd.NaT
-            item_qty = pd.to_numeric(item.get("quantity"), errors="coerce") if isinstance(item, dict) else None
-            if pd.notna(item_date) and item_qty is not None and pd.notna(item_qty):
+            item_qty = _safe_forecast_quantity(item.get("quantity")) if isinstance(item, dict) else None
+            if pd.notna(item_date) and item_qty is not None:
                 valid_forecast_points.append({"date": item_date, "quantity": round(float(item_qty), 2)})
 
     if valid_forecast_points:
@@ -8332,8 +8366,8 @@ def get_insights_aggregate_chart_data(df: pd.DataFrame | None, forecast_days: in
             continue
         for item in (forecast_entry.get("daily") or [])[:forecast_days]:
             item_date = pd.to_datetime(item.get("date"), errors="coerce") if isinstance(item, dict) else pd.NaT
-            item_qty = pd.to_numeric(item.get("quantity"), errors="coerce") if isinstance(item, dict) else None
-            if pd.notna(item_date) and item_qty is not None and pd.notna(item_qty):
+            item_qty = _safe_forecast_quantity(item.get("quantity")) if isinstance(item, dict) else None
+            if pd.notna(item_date) and item_qty is not None:
                 normalized_date = item_date.normalize()
                 future_totals[normalized_date] = future_totals.get(normalized_date, 0.0) + float(item_qty)
 
@@ -8415,6 +8449,8 @@ def get_forecast_summary(df: pd.DataFrame | None) -> dict[str, Any]:
             base["category_summary_map"][category] = {}
 
         forecast_map = artifacts.get("forecast_by_product", {}) if isinstance(artifacts, dict) else {}
+        product_chart_limit = forecast_chart_product_limit()
+        prebuilt_chart_products = set(products if full_forecast_chart_build_enabled() else products[:product_chart_limit])
 
         for option in get_forecast_view_options():
             range_key = option["key"]
@@ -8476,7 +8512,10 @@ def get_forecast_summary(df: pd.DataFrame | None) -> dict[str, Any]:
                     "stockout_probability_label": insight.get("stockout_probability_label"),
                     "forecast_status_label": insight.get("forecast_status_label", "Need more sales history"),
                 }
-                base["chart_map"][product_name][range_key] = get_product_chart_data(df, product_name, forecast_days=days, history_days=history_days, view_key=range_key)
+                if product_name in prebuilt_chart_products:
+                    base["chart_map"][product_name][range_key] = get_product_chart_data(df, product_name, forecast_days=days, history_days=history_days, view_key=range_key)
+                else:
+                    base["chart_map"][product_name][range_key] = base["chart_map"].get("__total__", {}).get(range_key, _empty_forecast_summary().get("initial_view", {}).get("chart", {}))
 
         initial_rows = base["details_by_range"].get("daily", [])
         base["priority_rows"] = initial_rows[:5]
@@ -8981,10 +9020,13 @@ def warm_up_generated_page_contexts(processed_df: pd.DataFrame | None) -> dict[s
         except Exception:
             status[key] = False
 
-    # Prepare shared artifacts and grouped sales series first. These helpers are
-    # display-only and reuse results that were already generated by the model
-    # pipeline above; they do not rerun SARIMA or XGBoost.
+    # Only prime the lightweight dashboard cache by default. Full page warmup is
+    # expensive on Render because it builds every forecast/report payload inside
+    # one request. Enable STOCKWISE_FULL_PAGE_WARMUP=1 only on larger instances.
     safe_prepare("dashboard", lambda: (get_model_artifacts(), _get_daily_sales_context(processed_df), get_dashboard_summary(processed_df)))
+    if str(os.environ.get("STOCKWISE_FULL_PAGE_WARMUP", "0")).strip().lower() not in {"1", "true", "yes", "on"}:
+        _state_set("page_context_warmup_status", status)
+        return status
 
     def prepare_insights() -> None:
         get_model_artifacts()
@@ -10305,10 +10347,11 @@ def _upload_data_phase_with_models():
                                 _state_set("model_ui_summary", artifacts.get("model_ui_summary"))
                                 _state_set("latest_model_run_id", None)
                                 clear_insights_cache()
-                                try:
-                                    warm_up_generated_page_contexts(processed_data)
-                                except Exception:
-                                    pass
+                                if page_context_warmup_enabled():
+                                    try:
+                                        warm_up_generated_page_contexts(processed_data)
+                                    except Exception as exc:
+                                        print(f"[StockWise page warmup skipped] {type(exc).__name__}: {exc}", flush=True)
                                 add_activity_log("Generate results", "Upload Sales Data", "Success")
                                 set_upload_feedback(
                                     "Results generated successfully in hosted-safe mode. Forecast and stockout risk outputs are ready without running heavy database jobs during upload.",
@@ -10320,7 +10363,8 @@ def _upload_data_phase_with_models():
                                 store_selected_dataset(selected_data, selected_filename, upload_mode=upload_mode)
                                 try:
                                     run_model_pipeline(current_user_id, upload_id, processed_data)
-                                    warm_up_generated_page_contexts(processed_data)
+                                    if page_context_warmup_enabled():
+                                        warm_up_generated_page_contexts(processed_data)
                                     add_result_notifications(current_user_id, processed_data)
                                     add_activity_log("Generate results", "Upload Sales Data", "Success")
                                     set_upload_feedback(

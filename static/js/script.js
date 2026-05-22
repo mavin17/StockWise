@@ -1920,16 +1920,23 @@
             return payload.summary_map?.__total__?.[activeRange] || {};
         }
 
+        function chartHasData(chart) {
+            return !!(chart && Array.isArray(chart.chart_datasets) && chart.chart_datasets.length);
+        }
+
         function getActiveChart() {
             const productValue = getSelectedProduct();
             const categoryValue = getSelectedCategory();
+            const totalChart = payload.chart_map?.__total__?.[activeRange] || {};
             if (productValue && productValue !== "__total__") {
-                return payload.chart_map?.[productValue]?.[activeRange] || {};
+                const productChart = payload.chart_map?.[productValue]?.[activeRange] || null;
+                return chartHasData(productChart) ? productChart : totalChart;
             }
             if (categoryValue) {
-                return payload.category_chart_map?.[categoryValue]?.[activeRange] || {};
+                const categoryChart = payload.category_chart_map?.[categoryValue]?.[activeRange] || null;
+                return chartHasData(categoryChart) ? categoryChart : totalChart;
             }
-            return payload.chart_map?.__total__?.[activeRange] || {};
+            return totalChart;
         }
 
         function updateFilterMetrics(rows) {
