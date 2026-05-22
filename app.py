@@ -8515,7 +8515,10 @@ def get_forecast_summary(df: pd.DataFrame | None) -> dict[str, Any]:
                 if product_name in prebuilt_chart_products:
                     base["chart_map"][product_name][range_key] = get_product_chart_data(df, product_name, forecast_days=days, history_days=history_days, view_key=range_key)
                 else:
-                    base["chart_map"][product_name][range_key] = base["chart_map"].get("__total__", {}).get(range_key, _empty_forecast_summary().get("initial_view", {}).get("chart", {}))
+                    fallback_chart = base["chart_map"].get("__total__", {}).get(range_key)
+                    if not isinstance(fallback_chart, dict):
+                        fallback_chart = {"labels": [], "observed": [], "forecast": [], "forecast_start_label": None}
+                    base["chart_map"][product_name][range_key] = fallback_chart
 
         initial_rows = base["details_by_range"].get("daily", [])
         base["priority_rows"] = initial_rows[:5]
