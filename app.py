@@ -178,6 +178,45 @@ FINAL_ROLE_OPTIONS = ["Owner", "Store Manager", "Operational Assistant"]
 USER_ROLE_OPTIONS = FINAL_ROLE_OPTIONS.copy()
 EMPLOYEE_ROLE_OPTIONS = ["Store Manager", "Operational Assistant"]
 
+# =========================================
+# HOSTED DEMO SEED + RENDER-SAFE DATA MODE
+# =========================================
+# The Render free/low-resource worker can be killed by large multipart uploads
+# plus database/model processing. For the online demo, StockWise can seed the
+# requested demo accounts and load the bundled CSV directly from the repo.
+STOCKWISE_DEMO_SEED_READY = False
+DEMO_DATASET_FILENAME = "stockwise_9_month__sales.csv"
+DEMO_DATASET_PATH = os.path.join(app.root_path, "database", "stockwise_demo_sales.csv")
+DEMO_STORE_DEFAULTS = {
+    "store_name": "WE COOKED BRO",
+    "store_type": "Sari-sari Store",
+    "location_area": "Pasig City",
+    "currency": "PHP",
+}
+DEMO_SEED_ACCOUNTS = [
+    {"full_name": "Zandra", "email": "zandra.com", "password": "Zandra", "role": "Owner"},
+    {"full_name": "Nicole", "email": "nicole.com", "password": "Nicole", "role": "Store Manager"},
+    {"full_name": "Alexzis", "email": "alexzis.com", "password": "Alexzis", "role": "Operational Assistant"},
+]
+DEMO_ACCOUNT_EMAILS = {account["email"].lower() for account in DEMO_SEED_ACCOUNTS}
+
+
+def demo_seed_enabled() -> bool:
+    return os.environ.get("STOCKWISE_DISABLE_DEMO_SEED", "0").strip().lower() not in {"1", "true", "yes"}
+
+
+def hosted_memory_upload_mode_enabled() -> bool:
+    """Default to safer in-memory uploads on Render unless explicitly disabled.
+
+    Set STOCKWISE_SAVE_UPLOADS_TO_DB=1 to restore database-backed upload saves.
+    """
+    return os.environ.get("STOCKWISE_SAVE_UPLOADS_TO_DB", "0").strip().lower() not in {"1", "true", "yes"}
+
+
+def is_demo_account_email(email: Any) -> bool:
+    return str(email or "").strip().lower() in DEMO_ACCOUNT_EMAILS
+
+
 ROLE_ALIASES = {
     "Store Owner": "Owner",
     "System User": "Owner",
@@ -758,6 +797,150 @@ def refresh_session_user(user_id: int | None = None) -> None:
         session["user_store_id"] = user.get("store_id") or ensure_user_workspace(user_id)
         session["user_membership_id"] = get_current_membership_id(user_id, session.get("user_store_id"))
     session["user_profile_image"] = user.get("profile_image") or ""
+
+
+def ensure_demo_accounts_seeded() -> None:
+    """Create the requested demo accounts and store workspace idempotently."""
+    global STOCKWISE_DEMO_SEED_READY
+    if STOCKWISE_DEMO_SEED_READY or not demo_seed_enabled():
+        return
+
+    try:
+        ensure_multi_user_schema()
+        ensure_user_settings_table()
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        try:
+            owner_account = next(account for account in DEMO_SEED_ACCOUNTS if normalize_role(account.get("role")) == "Owner")
+
+            def upsert_user(account: dict[str, str], store_id: int | None = None, created_by: int | None = None) -> int:
+                email = normalize_email(account["email"])
+                role = normalize_role(account["role"])
+                username = email.split("@")[0]
+                password_hash = generate_password_hash(account["password"])
+                cursor.execute("SELECT user_id FROM users WHERE LOWER(email) = %s LIMIT 1", (email,))
+                row = cursor.fetchone()
+                if row:
+                    user_id = int(row["user_id"])
+                    cursor.execute(
+                        """
+                        UPDATE users
+                        SET full_name = %s,
+                            position = %s,
+                            role = %s,
+                            store_id = COALESCE(%s, store_id),
+                            created_by = COALESCE(%s, created_by),
+                            username = %s,
+                            password_hash = %s,
+                            account_status = 'active',
+                            is_active = 1
+                        WHERE user_id = %s
+                        """,
+                        (account["full_name"], role, role, store_id, created_by, username, password_hash, user_id),
+                    )
+                    return user_id
+                cursor.execute(
+                    """
+                    INSERT INTO users (full_name, email, position, role, store_id, created_by, username, password_hash, is_active, account_status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, 'active')
+                    """,
+                    (account["full_name"], email, role, role, store_id, created_by, username, password_hash),
+                )
+                return int(cursor.lastrowid)
+
+            owner_id = upsert_user(owner_account)
+            cursor.execute("SELECT store_id FROM stores WHERE owner_user_id = %s ORDER BY store_id LIMIT 1", (owner_id,))
+            store_row = cursor.fetchone()
+            if store_row:
+                store_id = int(store_row["store_id"])
+                cursor.execute(
+                    "UPDATE stores SET store_name = %s WHERE store_id = %s",
+                    (DEMO_STORE_DEFAULTS["store_name"], store_id),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO stores (owner_user_id, store_name) VALUES (%s, %s)",
+                    (owner_id, DEMO_STORE_DEFAULTS["store_name"]),
+                )
+                store_id = int(cursor.lastrowid)
+
+            cursor.execute(
+                "UPDATE users SET store_id = %s, role = 'Owner', position = 'Owner', account_status = 'active', is_active = 1 WHERE user_id = %s",
+                (store_id, owner_id),
+            )
+
+            for account in DEMO_SEED_ACCOUNTS:
+                role = normalize_role(account["role"])
+                user_id = owner_id if role == "Owner" else upsert_user(account, store_id=store_id, created_by=owner_id)
+                cursor.execute(
+                    """
+                    INSERT INTO store_memberships (store_id, user_id, role, account_status, is_active, created_by, joined_at)
+                    VALUES (%s, %s, %s, 'active', 1, %s, NOW())
+                    ON DUPLICATE KEY UPDATE
+                        role = VALUES(role),
+                        account_status = 'active',
+                        is_active = 1,
+                        removed_at = NULL,
+                        reactivated_at = NOW()
+                    """,
+                    (store_id, user_id, role, owner_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO user_settings (
+                        user_id, store_name, store_type, location_area, store_logo, currency,
+                        default_upload_mode, default_time_range, default_product_view,
+                        show_safe_products_dashboard, default_report_type,
+                        default_report_period, export_format, include_filtered_rows_only,
+                        data_date_format, data_time_format, payday_indicator_handling,
+                        duplicate_handling, column_mapping_json, onboarding_completed
+                    )
+                    VALUES (%s, %s, %s, %s, NULL, %s, 'new', '30', 'needs_attention', 'no',
+                            'demand_forecast_summary', 'last_30_days', 'csv', 'yes',
+                            'auto', 'auto', 'auto', 'remove_exact', %s, 1)
+                    ON DUPLICATE KEY UPDATE
+                        store_name = VALUES(store_name),
+                        store_type = VALUES(store_type),
+                        location_area = VALUES(location_area),
+                        currency = VALUES(currency),
+                        default_upload_mode = VALUES(default_upload_mode),
+                        default_report_period = VALUES(default_report_period),
+                        data_date_format = VALUES(data_date_format),
+                        data_time_format = VALUES(data_time_format),
+                        payday_indicator_handling = VALUES(payday_indicator_handling),
+                        duplicate_handling = VALUES(duplicate_handling),
+                        column_mapping_json = VALUES(column_mapping_json),
+                        onboarding_completed = 1
+                    """,
+                    (
+                        user_id,
+                        DEMO_STORE_DEFAULTS["store_name"],
+                        DEMO_STORE_DEFAULTS["store_type"],
+                        DEMO_STORE_DEFAULTS["location_area"],
+                        DEMO_STORE_DEFAULTS["currency"],
+                        json.dumps(DEFAULT_COLUMN_MAPPING),
+                    ),
+                )
+
+            conn.commit()
+            STOCKWISE_DEMO_SEED_READY = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+    except Exception as exc:
+        print(f"[StockWise demo seed skipped] {type(exc).__name__}: {exc}", flush=True)
+
+
+@app.before_request
+def seed_demo_accounts_before_request():
+    # Avoid touching MySQL for static asset requests, but seed before auth/login.
+    if request.endpoint == "static":
+        return None
+    ensure_demo_accounts_seeded()
+    return None
 
 
 def update_last_login(user_id: int | None) -> None:
@@ -5071,8 +5254,11 @@ def store_processed_dataset(df: pd.DataFrame, filename: str, upload_id: int | No
     state.processed_data = df.copy()
     state.processed_filename = filename
     state.processed_at = datetime.now()
+    state.memory_only_upload = upload_id is None
     if upload_id is not None:
         state.latest_upload_id = upload_id
+    else:
+        state.latest_upload_id = None
     clear_insights_cache()
 
 
@@ -5081,6 +5267,7 @@ def clear_processed_dataset() -> None:
     state.processed_data = None
     state.processed_filename = None
     state.processed_at = None
+    state.memory_only_upload = False
     clear_model_cache()
     clear_insights_cache()
 
@@ -5673,6 +5860,15 @@ def _ensure_state_loaded_from_db() -> None:
     if not user_id:
         return
     state = get_app_state()
+
+    # Demo accounts and Render-safe uploads keep data in memory for the current
+    # worker. Do not clear it just because there is no database-backed upload.
+    if getattr(state, "memory_only_upload", False) and state.processed_data is not None:
+        return
+    if is_demo_account_email(session.get("user_email")):
+        if load_demo_dataset_for_current_session(force=False) is not None:
+            return
+
     try:
         latest_meta = _load_latest_upload_metadata(user_id)
     except Exception:
@@ -5720,6 +5916,46 @@ def get_processed_dataset() -> pd.DataFrame | None:
 def get_processed_filename() -> str | None:
     _ensure_state_loaded_from_db()
     return get_app_state().processed_filename
+
+
+def load_bundled_demo_dataset() -> pd.DataFrame | None:
+    """Load the bundled demo CSV without using the upload endpoint or MySQL."""
+    if not os.path.exists(DEMO_DATASET_PATH):
+        return None
+    try:
+        raw_df = pd.read_csv(DEMO_DATASET_PATH, encoding="utf-8-sig")
+        normalized_df = normalize_dataframe(raw_df, get_data_format_preferences())
+        processed_df, _summary = preprocess_dataset(normalized_df, base_df=None, upload_mode="new")
+        return processed_df if processed_df is not None and not processed_df.empty else None
+    except Exception as exc:
+        print(f"[StockWise demo dataset load failed] {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def load_demo_dataset_for_current_session(force: bool = False) -> pd.DataFrame | None:
+    """Attach the bundled demo data to the current process/session for demo accounts."""
+    user_email = session.get("user_email")
+    if not is_demo_account_email(user_email):
+        return None
+
+    state = get_app_state()
+    if not force and state.processed_data is not None and getattr(state, "memory_only_upload", False):
+        return state.processed_data
+
+    demo_df = load_bundled_demo_dataset()
+    if demo_df is None or demo_df.empty:
+        return None
+
+    store_processed_dataset(demo_df, DEMO_DATASET_FILENAME, upload_id=None)
+    state.selected_data = None
+    state.selected_filename = None
+    state.selected_file_size = None
+    state.selected_file_type = None
+    state.selected_at = None
+    state.last_upload_mode = "new"
+    _state_set("latest_model_artifacts", {"available": False, "upload_id": None, "model_run_id": None, "forecast_by_product": {}, "risk_by_product": {}, "model_ui_summary": _empty_model_ui_summary()})
+    _state_set("latest_model_run_id", None)
+    return demo_df
 
 
 def get_last_processed_label() -> str:
@@ -8709,6 +8945,7 @@ def auth():
                             session["user_store_id"] = membership.get("store_id")
                             session["user_membership_id"] = membership.get("membership_id")
                             refresh_session_user(user["user_id"])
+                            load_demo_dataset_for_current_session(force=True)
                             update_last_login(user["user_id"])
                             add_activity_log("Login", "Authentication", "Success", user_id=user["user_id"], store_id=session.get("user_store_id"))
 
@@ -8972,6 +9209,128 @@ def _dashboard_recovery_summary() -> dict[str, Any]:
     }
 
 
+def _lightweight_priority_rows(df: pd.DataFrame | None) -> list[dict[str, Any]]:
+    """Build dashboard rows without loading model artifacts or MySQL."""
+    if df is None or df.empty or "product_name" not in df.columns:
+        return []
+    working = df.copy()
+    working["date"] = pd.to_datetime(working.get("date"), errors="coerce") if "date" in working.columns else pd.NaT
+    working["quantity_sold"] = pd.to_numeric(working.get("quantity_sold", 0), errors="coerce").fillna(0)
+    for col in ["current_stock", "reorder_point", "unit_price"]:
+        working[col] = pd.to_numeric(working.get(col, np.nan), errors="coerce")
+    if "category" not in working.columns:
+        working["category"] = "Seasonal / Miscellaneous Items"
+    if "unit_type" not in working.columns:
+        working["unit_type"] = "Unit"
+    working = working.dropna(subset=["product_name"])
+    if working.empty:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    last_date = working["date"].dropna().max() if "date" in working.columns else pd.NaT
+    for product_name, product_rows in working.groupby("product_name"):
+        product_rows = product_rows.sort_values("date") if "date" in product_rows.columns else product_rows
+        recent_rows = product_rows
+        previous_rows = product_rows.iloc[0:0]
+        if pd.notna(last_date) and "date" in product_rows.columns:
+            recent_rows = product_rows[product_rows["date"] >= last_date - pd.Timedelta(days=6)]
+            previous_rows = product_rows[(product_rows["date"] >= last_date - pd.Timedelta(days=13)) & (product_rows["date"] < last_date - pd.Timedelta(days=6))]
+        recent_qty = float(recent_rows["quantity_sold"].sum()) if not recent_rows.empty else 0.0
+        previous_qty = float(previous_rows["quantity_sold"].sum()) if not previous_rows.empty else 0.0
+        trend = "Rising" if recent_qty > max(previous_qty * 1.10, previous_qty + 3) else ("Declining" if previous_qty and recent_qty < previous_qty * 0.85 else "Stable")
+
+        latest = product_rows.iloc[-1]
+        current_stock = latest.get("current_stock")
+        reorder_point = latest.get("reorder_point")
+        current_stock_num = float(current_stock) if pd.notna(current_stock) else None
+        reorder_num = float(reorder_point) if pd.notna(reorder_point) else None
+        average_daily = recent_qty / max(int(recent_rows["date"].nunique()) if "date" in recent_rows.columns and not recent_rows.empty else 7, 1)
+        forecast_7_day = average_daily * 7
+
+        if current_stock_num is not None and (current_stock_num <= 0 or (reorder_num is not None and current_stock_num <= reorder_num) or forecast_7_day > current_stock_num):
+            risk_level = "High"
+            stock_status = "Low Stock"
+            suggested_action = "Consider restocking soon"
+            note = "Latest stock is low compared with recent sales movement."
+        elif current_stock_num is not None and (trend == "Rising" or (reorder_num is not None and current_stock_num <= reorder_num * 1.5)):
+            risk_level = "Moderate"
+            stock_status = "Needs Review"
+            suggested_action = "Review before next restocking"
+            note = "Recent demand or stock level suggests this product should be monitored."
+        else:
+            risk_level = "Low"
+            stock_status = "Sufficient"
+            suggested_action = "Stock appears sufficient"
+            note = "Latest stock appears sufficient based on recent sales."
+
+        rows.append({
+            "product_name": str(product_name),
+            "category": standardize_product_category(latest.get("category", "Seasonal / Miscellaneous Items")),
+            "current_stock": int(current_stock_num) if current_stock_num is not None else "No stock data",
+            "reorder_point": int(reorder_num) if reorder_num is not None else "No reorder point",
+            "unit_type": str(latest.get("unit_type") or "Unit"),
+            "unit_price": float(latest.get("unit_price")) if pd.notna(latest.get("unit_price")) else 0.0,
+            "average_daily_demand": round(float(average_daily), 2),
+            "forecast_demand": round(float(forecast_7_day), 2),
+            "trend": trend,
+            "risk_level": risk_level,
+            "risk_display": risk_level,
+            "priority": risk_level,
+            "priority_display": risk_level,
+            "stock_status": stock_status,
+            "assistant_stock_status": _assistant_stock_status_from_store_status(stock_status),
+            "suggested_action": suggested_action,
+            "display_note": note,
+            "display_note_short": _short_display_note(note),
+            "why_flagged": note,
+            "dashboard_main_reason": _dashboard_main_reason(note),
+            "is_low_stock": stock_status == "Low Stock",
+        })
+    risk_order = {"High": 0, "Moderate": 1, "Low": 2}
+    rows.sort(key=lambda item: (risk_order.get(item.get("risk_level", "Low"), 9), str(item.get("product_name", "")).casefold()))
+    return rows
+
+
+def _lightweight_dashboard_summary(df: pd.DataFrame | None) -> dict[str, Any]:
+    if df is None or df.empty:
+        return _dashboard_recovery_summary()
+    priority_rows = _lightweight_priority_rows(df)
+    chart_data = get_dashboard_chart_data(df)
+    total_sales_volume = 0.0
+    try:
+        qty = pd.to_numeric(df.get("quantity_sold", 0), errors="coerce").fillna(0)
+        price = pd.to_numeric(df.get("unit_price", 0), errors="coerce").fillna(0)
+        total_sales_volume = round(float((qty * price).sum()), 2)
+    except Exception:
+        total_sales_volume = 0.0
+    metrics = {
+        "total_products": len(priority_rows),
+        "high_risk_items": sum(1 for item in priority_rows if item.get("risk_level") == "High"),
+        "moderate_risk_items": sum(1 for item in priority_rows if item.get("risk_level") == "Moderate"),
+        "low_risk_items": sum(1 for item in priority_rows if item.get("risk_level") == "Low"),
+        "rising_demand_products": sum(1 for item in priority_rows if item.get("trend") == "Rising"),
+        "total_sales_volume": total_sales_volume,
+        "most_sold_product": max(priority_rows, key=lambda row: row.get("forecast_demand", 0)).get("product_name") if priority_rows else "No uploaded sales data yet",
+        "highest_risk_product": next((row.get("product_name") for row in priority_rows if row.get("risk_level") == "High"), "No uploaded sales data yet"),
+    }
+    return {
+        "metrics": metrics,
+        "priority_rows": priority_rows,
+        "dashboard_priority_rows": priority_rows[:5],
+        "buyer_behavior_insights": get_buyer_behavior_insights(df, priority_rows),
+        "chart_type": chart_data.get("chart_type", "line"),
+        "chart_labels": chart_data.get("chart_labels", []),
+        "chart_datasets": chart_data.get("chart_datasets", []),
+        "chart_message": chart_data.get("chart_message"),
+        "chart_options": chart_data.get("chart_options", {}),
+        "chart_explanation": chart_data.get("chart_explanation") or ("Overall demand based on demo sales records." if chart_data.get("chart_labels") else "No chart data available yet."),
+        "chart_focus_label": chart_data.get("chart_focus_label", "Overall Demand"),
+        "has_forecast": False,
+        "forecast_start_label": None,
+        "model_ui_summary": _empty_model_ui_summary(),
+    }
+
+
 @app.route("/dashboard")
 @login_required
 @role_required("dashboard")
@@ -8982,11 +9341,13 @@ def dashboard():
     # database-backed records, but the landing dashboard should fail open.
     skip_dataset_reload = True
     try:
-        dataset = get_app_state().processed_data
+        dataset = load_demo_dataset_for_current_session(force=False)
+        if dataset is None:
+            dataset = get_app_state().processed_data
     except Exception:
         dataset = None
 
-    dashboard_summary = _dashboard_recovery_summary()
+    dashboard_summary = _lightweight_dashboard_summary(dataset) if dataset is not None else _dashboard_recovery_summary()
     upload_status = _state_only_upload_status()
     current_role = get_session_role()
     try:
@@ -9730,27 +10091,42 @@ def _upload_data_phase_with_models():
                         set_upload_feedback("Your session could not be verified. Please log in again.", "error")
                     else:
                         try:
-                            upload_id = save_processed_dataset_to_database(user_id=current_user_id, filename=processed_filename, processed_df=processed_data, upload_mode=upload_mode)
-                            store_processed_dataset(processed_data, processed_filename, upload_id=upload_id)
-                            store_selected_dataset(selected_data, selected_filename, upload_mode=upload_mode)
-                            try:
-                                run_model_pipeline(current_user_id, upload_id, processed_data)
-                                warm_up_generated_page_contexts(processed_data)
-                                add_result_notifications(current_user_id, processed_data)
+                            if hosted_memory_upload_mode_enabled():
+                                # Render-safe mode: avoid long DB/model work during the request.
+                                # Data is available immediately in this worker/session; the bundled
+                                # demo CSV remains the persistent baseline across redeploys.
+                                store_processed_dataset(processed_data, processed_filename, upload_id=None)
+                                store_selected_dataset(selected_data, selected_filename, upload_mode=upload_mode)
+                                _state_set("latest_model_artifacts", {"available": False, "upload_id": None, "model_run_id": None, "forecast_by_product": {}, "risk_by_product": {}, "model_ui_summary": _empty_model_ui_summary()})
+                                _state_set("latest_model_run_id", None)
                                 add_activity_log("Generate results", "Upload Sales Data", "Success")
                                 set_upload_feedback(
-                                    "Results generated successfully.",
+                                    "Results generated successfully in hosted-safe mode. Dashboard and product insights are ready without running heavy database/model jobs during upload.",
                                     "success",
                                 )
-                            except Exception:
-                                notify_upload_event("Upload needs review", "Sales records were saved, but results could not be generated yet.", "warning", success=False)
-                                add_activity_log("Generate results", "Upload Sales Data", "Failed")
-                                clear_model_cache()
-                                set_upload_feedback(
-                                    "Sales records were saved, but forecast and stockout risk results could not be generated yet. Please review the uploaded records and try again.",
-                                    "error",
-                                )
-                        except Exception:
+                            else:
+                                upload_id = save_processed_dataset_to_database(user_id=current_user_id, filename=processed_filename, processed_df=processed_data, upload_mode=upload_mode)
+                                store_processed_dataset(processed_data, processed_filename, upload_id=upload_id)
+                                store_selected_dataset(selected_data, selected_filename, upload_mode=upload_mode)
+                                try:
+                                    run_model_pipeline(current_user_id, upload_id, processed_data)
+                                    warm_up_generated_page_contexts(processed_data)
+                                    add_result_notifications(current_user_id, processed_data)
+                                    add_activity_log("Generate results", "Upload Sales Data", "Success")
+                                    set_upload_feedback(
+                                        "Results generated successfully.",
+                                        "success",
+                                    )
+                                except Exception:
+                                    notify_upload_event("Upload needs review", "Sales records were saved, but results could not be generated yet.", "warning", success=False)
+                                    add_activity_log("Generate results", "Upload Sales Data", "Failed")
+                                    clear_model_cache()
+                                    set_upload_feedback(
+                                        "Sales records were saved, but forecast and stockout risk results could not be generated yet. Please review the uploaded records and try again.",
+                                        "error",
+                                    )
+                        except Exception as exc:
+                            print(f"[StockWise upload process failed] {type(exc).__name__}: {exc}", flush=True)
                             notify_upload_event("Upload failed", "The uploaded records could not be saved or processed. Please review the file and try again.", "error", success=False)
                             add_activity_log("Generate results", "Upload Sales Data", "Failed")
                             set_upload_feedback(
